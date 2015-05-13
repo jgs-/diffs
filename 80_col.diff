@@ -1,0 +1,15 @@
+Index: style.9
+===================================================================
+RCS file: /cvs/src/share/man/man9/style.9,v
+retrieving revision 1.58
+diff -u -r1.58 style.9
+--- style.9	1 Jun 2014 15:44:09 -0000	1.58
++++ style.9	23 Jan 2015 06:42:17 -0000
+@@ -325,6 +325,7 @@
+ .Pp
+ Indentation is an 8 character tab.
+ Second level indents are four spaces.
++All code should fit in 80 columns.
+ .Bd -literal -offset indent
+ while (cnt < 20)
+ 	z = a + really + long + statement + that + needs +

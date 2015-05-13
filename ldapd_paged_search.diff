@@ -1,0 +1,268 @@
+===================================================================
+RCS file: /cvs/src/usr.sbin/ypldap/aldap.c,v
+retrieving revision 1.29
+retrieving revision 1.30
+diff -u -r1.29 -r1.30
+--- src/usr.sbin/ypldap/aldap.c	2012/03/15 03:44:46	1.29
++++ src/usr.sbin/ypldap/aldap.c	2012/04/30 21:40:03	1.30
+@@ -1,5 +1,5 @@
+-/*	$Id: aldap.c,v 1.29 2012/03/15 03:44:46 jmatthew Exp $ */
+-/*	$OpenBSD: aldap.c,v 1.29 2012/03/15 03:44:46 jmatthew Exp $ */
++/*	$Id: aldap.c,v 1.30 2012/04/30 21:40:03 jmatthew Exp $ */
++/*	$OpenBSD: aldap.c,v 1.30 2012/04/30 21:40:03 jmatthew Exp $ */
+ 
+ /*
+  * Copyright (c) 2008 Alexander Schrijver <aschrijver@openbsd.org>
+@@ -31,11 +31,15 @@
+ #endif
+ #define VERSION 3
+ 
+-static struct ber_element	*ldap_parse_search_filter(struct ber_element*, char *);
+-static struct ber_element	*ldap_do_parse_search_filter(struct ber_element*, char **);
++static struct ber_element	*ldap_parse_search_filter(struct ber_element *,
++				    char *);
++static struct ber_element	*ldap_do_parse_search_filter(
++				    struct ber_element *, char **);
+ char				**aldap_get_stringset(struct ber_element *);
+ char				*utoa(char *);
+ char				*parseval(char *, size_t);
++int				aldap_create_page_control(struct ber_element *,
++				    int, struct aldap_page_control *);
+ 
+ #ifdef DEBUG
+ void			 ldap_debug_elements(struct ber_element *);
+@@ -143,22 +147,31 @@
+ 
+ int
+ aldap_search(struct aldap *ldap, char *basedn, enum scope scope, char *filter,
+-    char **attrs, int typesonly, int sizelimit, int timelimit)
++    char **attrs, int typesonly, int sizelimit, int timelimit,
++    struct aldap_page_control *page)
+ {
+-	struct ber_element *root = NULL, *ber;
++	struct ber_element *root = NULL, *ber, *c;
+ 	int i, error;
+ 
+ 	if ((root = ber_add_sequence(NULL)) == NULL)
+ 		goto fail;
+ 
+-	ber = ber_printf_elements(root, "d{tsEEddb", ++ldap->msgid, BER_CLASS_APP,
+-	    (unsigned long)LDAP_REQ_SEARCH, basedn, (long long)scope,
+-	    (long long)LDAP_DEREF_NEVER, sizelimit, timelimit, typesonly);
++	ber = ber_printf_elements(root, "d{t", ++ldap->msgid, BER_CLASS_APP,
++	    (unsigned long) LDAP_REQ_SEARCH);
+ 	if (ber == NULL) {
+ 		ldap->err = ALDAP_ERR_OPERATION_FAILED;
+ 		goto fail;
+ 	}
+ 
++	c = ber;	
++	ber = ber_printf_elements(ber, "sEEddb", basedn, (long long)scope,
++	                         (long long)LDAP_DEREF_NEVER, sizelimit, 
++				 timelimit, typesonly);
++	if (ber == NULL) {
++		ldap->err = ALDAP_ERR_OPERATION_FAILED;
++		goto fail;
++	}
++
+ 	if ((ber = ldap_parse_search_filter(ber, filter)) == NULL) {
+ 		ldap->err = ALDAP_ERR_PARSER_ERROR;
+ 		goto fail;
+@@ -172,6 +185,8 @@
+ 				goto fail;
+ 		}
+ 
++	aldap_create_page_control(c, 100, page);
++
+ 	LDAP_DEBUG("aldap_search", root);
+ 
+ 	error = ber_write_elements(&ldap->ber, root);
+@@ -191,14 +206,53 @@
+ 	return (-1);
+ }
+ 
++int
++aldap_create_page_control(struct ber_element *elm, int size,
++    struct aldap_page_control *page)
++{
++	int len;
++	struct ber c;
++	struct ber_element *ber = NULL;
++
++	c.br_wbuf = NULL;
++	c.fd = -1;
++
++	ber = ber_add_sequence(NULL);
++
++	if (page == NULL) {
++		if (ber_printf_elements(ber, "ds", 50, "") == NULL)
++			goto fail;
++	} else {
++		if (ber_printf_elements(ber, "dx", 50, page->cookie,
++			    page->cookie_len) == NULL)
++			goto fail;
++	}
++
++	if ((len = ber_write_elements(&c, ber)) < 1)
++		goto fail;
++	if (ber_printf_elements(elm, "{t{sx", 2, 0, LDAP_PAGED_OID,
++		                c.br_wbuf, (size_t)len) == NULL)
++		goto fail;
++
++	ber_free_elements(ber);
++	ber_free(&c);
++	return len;
++fail:
++	if (ber != NULL)
++		ber_free_elements(ber);
++	ber_free(&c);	
++
++	return (-1);
++}
++
+ struct aldap_message *
+ aldap_parse(struct aldap *ldap)
+ {
+-	int			 class = 0;
++	int			 class;
++	unsigned long		 type;
+ 	long long		 msgid = 0;
+-	unsigned long		 type  = 0;
+ 	struct aldap_message	*m;
+-	struct ber_element	*a = NULL;
++	struct ber_element	*a = NULL, *ep;
+ 
+ 	if ((m = calloc(1, sizeof(struct aldap_message))) == NULL)
+ 		return NULL;
+@@ -228,6 +282,15 @@
+ 		if (m->body.res.rescode == LDAP_REFERRAL)
+ 			if (ber_scanf_elements(a, "{e", &m->references) != 0)
+ 				goto parsefail;
++		if (m->msg->be_sub) {
++			for (ep = m->msg->be_sub; ep != NULL; ep = ep->be_next) {
++				ber_scanf_elements(ep, "t", &class, &type);
++				if (class == 2 && type == 0)
++					m->page = aldap_parse_page_control(ep->be_sub->be_sub,
++					    ep->be_sub->be_sub->be_len);
++			}
++		} else
++			m->page = NULL;
+ 		break;
+ 	case LDAP_RES_SEARCH_ENTRY:
+ 		if (ber_scanf_elements(m->protocol_op, "{eS{e", &m->dn,
+@@ -245,6 +308,53 @@
+ 	ldap->err = ALDAP_ERR_PARSER_ERROR;
+ 	aldap_freemsg(m);
+ 	return NULL;
++}
++
++struct aldap_page_control *
++aldap_parse_page_control(struct ber_element *control, size_t len) 
++{
++	char *oid, *s;
++	char *encoded;
++	struct ber b;
++	struct ber_element *elm;
++	struct aldap_page_control *page;
++
++	b.br_wbuf = NULL;
++	b.fd = -1;
++	ber_scanf_elements(control, "ss", &oid, &encoded);
++	ber_set_readbuf(&b, encoded, control->be_next->be_len);
++	elm = ber_read_elements(&b, NULL);
++
++	if ((page = malloc(sizeof(struct aldap_page_control))) == NULL) {
++		if (elm != NULL)
++			ber_free_elements(elm);
++		ber_free(&b);
++		return NULL;
++	}
++
++	ber_scanf_elements(elm->be_sub, "is", &page->size, &s);
++	page->cookie_len = elm->be_sub->be_next->be_len;
++
++	if ((page->cookie = malloc(page->cookie_len)) == NULL) {
++		if (elm != NULL)
++			ber_free_elements(elm);
++		ber_free(&b);
++		free(page);
++		return NULL;
++	}
++	memcpy(page->cookie, s, page->cookie_len);
++
++	ber_free_elements(elm);
++	ber_free(&b);
++	return page;
++}
++
++void
++aldap_freepage(struct aldap_page_control *page)
++{
++	if (page->cookie)
++		free(page->cookie);
++	free(page);
+ }
+ 
+ void
+
+===================================================================
+RCS file: /cvs/src/usr.sbin/ypldap/aldap.h,v
+retrieving revision 1.8
+retrieving revision 1.9
+diff -u -r1.8 -r1.9
+--- src/usr.sbin/ypldap/aldap.h	2011/08/28 16:37:28	1.8
++++ src/usr.sbin/ypldap/aldap.h	2012/04/30 21:40:03	1.9
+@@ -1,5 +1,5 @@
+-/*	$Id: aldap.h,v 1.8 2011/08/28 16:37:28 aschrijver Exp $ */
+-/*	$OpenBSD: aldap.h,v 1.8 2011/08/28 16:37:28 aschrijver Exp $ */
++/*	$Id: aldap.h,v 1.9 2012/04/30 21:40:03 jmatthew Exp $ */
++/*	$OpenBSD: aldap.h,v 1.9 2012/04/30 21:40:03 jmatthew Exp $ */
+ 
+ /*
+  * Copyright (c) 2008 Alexander Schrijver <aschrijver@openbsd.org>
+@@ -23,6 +23,7 @@
+ 
+ #define LDAP_URL "ldap://"
+ #define LDAP_PORT 389
++#define LDAP_PAGED_OID  "1.2.840.113556.1.4.319"
+ 
+ struct aldap {
+ #define ALDAP_ERR_SUCCESS		0
+@@ -34,6 +35,12 @@
+ 	struct ber	ber;
+ };
+ 
++struct aldap_page_control {
++	int size;
++	char *cookie;
++	unsigned int cookie_len;
++};
++
+ struct aldap_message {
+ 	int msgid;
+ 	int message_type;
+@@ -56,6 +63,7 @@
+ 		}			 search;
+ 	} body;
+ 	struct ber_element	*references;
++	struct aldap_page_control *page; 
+ };
+ 
+ enum aldap_protocol {
+@@ -188,7 +196,7 @@
+ 
+ int	 aldap_bind(struct aldap *, char *, char *);
+ int	 aldap_unbind(struct aldap *);
+-int	 aldap_search(struct aldap *, char *, enum scope, char *, char **, int, int, int);
++int	 aldap_search(struct aldap *, char *, enum scope, char *, char **, int, int, int, struct aldap_page_control *);
+ int	 aldap_get_errno(struct aldap *, const char **);
+ 
+ int	 aldap_get_resultcode(struct aldap_message *);
+@@ -207,3 +215,6 @@
+ int	 aldap_first_attr(struct aldap_message *, char **, char ***);
+ int	 aldap_next_attr(struct aldap_message *, char **, char ***);
+ int	 aldap_free_attr(char **);
++
++struct aldap_page_control *aldap_parse_page_control(struct ber_element *, size_t len);
++void	 aldap_freepage(struct aldap_page_control *);
+
